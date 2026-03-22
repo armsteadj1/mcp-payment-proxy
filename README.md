@@ -1,36 +1,96 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# MPP Payment Proxy — BT Card Integration
 
-## Getting Started
+## What is MPP?
 
-First, run the development server:
+[Machine Payments Protocol (MPP)](https://mpp.dev) is an HTTP-native payment scheme built on the `Payment` HTTP Authentication standard. It lets any API gate access behind a micropayment: the server issues a `402 Payment Required` challenge, the client fulfills it with a cryptographic credential, and the server verifies the payment before returning the protected resource. No subscriptions, no API keys — just pay-per-request.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## What Basis Theory does in this flow
+
+**Basis Theory acts as both the Enabler and the Decryptor** for card payments:
+
+- **Enabler** — The client requests an encryption public key from the BT proxy URL included in the 402 challenge. It uses that key to encrypt the card data into a JWE (JSON Web Encryption) token, so raw card data never leaves the client unencrypted.
+- **Decryptor** — When the server receives the JWE credential, it forwards it directly to the BT proxy (`BT-PROXY-KEY` authenticated). BT decrypts the JWE server-side, tokenizes the card, and charges it — returning only an authorization reference. The Vercel server never sees the raw card number.
+
+## Why this matters
+
+> **BT isn't a Stripe Projects provider yet — this shows exactly what that integration would look like.**
+
+Stripe Projects lets you provision infrastructure (Neon, PostHog, etc.) alongside your Stripe app. Basis Theory would be a natural fit as a PCI-safe card vault + proxy provider. This repo demonstrates the full MPP + BT integration pattern so that wiring it up as a Stripe Projects provider would be straightforward.
+
+## Stack
+
+- **Next.js 15** App Router + TypeScript (Vercel)
+- **`mppx`** — TypeScript SDK for Machine Payments Protocol
+- **`@neondatabase/serverless`** — Neon Postgres for payment records
+- **`posthog-node`** — PostHog analytics events
+- **`@basis-theory/node-sdk`** — Basis Theory operations
+
+## Payment Flow
+
+```
+1. Client          →  GET /api/pay
+2. Server          →  402 + WWW-Authenticate: Payment bt/charge amount=0.01 enabler=<BT_PROXY_URL>
+3. Client          →  GET <BT_PROXY_URL>/encryption-key  (fetch BT public key)
+4. Client          →  Encrypt card data → JWE token
+5. Client          →  GET /api/pay  Authorization: Payment { jwe: "<encrypted-token>" }
+6. Server          →  POST <BT_PROXY_URL>  BT-PROXY-KEY: <key>  body: { jwe }
+   BT Proxy        →  Decrypt JWE → charge card → return { authorization_ref, token }
+7. Server          →  INSERT INTO payments ... ; PostHog.capture("payment_succeeded")
+8. Server          →  200 + Payment-Receipt + { message: "paid access granted" }
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Provisioning
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Stripe Projects (Neon + PostHog)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+stripe projects add neon/postgres        # → DATABASE_URL
+stripe projects add posthog/analytics   # → POSTHOG_PROJECT_API_KEY
+```
 
-## Learn More
+### Basis Theory (manual)
 
-To learn more about Next.js, take a look at the following resources:
+1. Create an account at [basistheory.com](https://basistheory.com)
+2. Create a Proxy configuration to handle card decryption + charge
+3. Copy your Proxy URL and API key
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### Environment Variables
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+cp .env.example .env.local
+# Fill in: DATABASE_URL, POSTHOG_PROJECT_API_KEY, BT_PROXY_KEY, BT_PROXY_URL, MPP_SECRET_KEY
+# Generate MPP secret: openssl rand -hex 32
+```
 
-## Deploy on Vercel
+### Initialize the database
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+npm run db:setup
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Testing
+
+```bash
+# Install the mppx CLI globally
+npm install -g mppx
+
+# Create a test account (auto-funded on testnet)
+mppx account create
+
+# Make a paid request
+mppx https://your-deployment.vercel.app/api/pay
+```
+
+## Routes
+
+| Route | Description |
+|-------|-------------|
+| `GET /api/pay` | MPP payment-gated resource (card via BT proxy) |
+| `POST /api/mcp` | MCP server (Streamable HTTP) with payment tools |
+| `GET /` | Status page with payment stats |
+
+## Deploy
+
+```bash
+vercel deploy
+```
